@@ -44,6 +44,8 @@ function afterData() {
   if (!$('.app')) shell();
   applySettings();
   M.autoPurge();
+  try { const tz = Intl.DateTimeFormat().resolvedOptions().timeZone; if (tz && M.settings().tz !== tz) M.saveSettings({ tz }); } catch (e) { /* yok */ }
+  pushRefresh();
   ui.booted = true;
   renderAll();
 }
@@ -508,10 +510,7 @@ function viewSettings() {
       <select data-set="dayStart" class="input" style="width:auto;height:40px">${[0, 1, 2, 3, 4, 5, 6].map(h => `<option value="${h}" ${Number(s.dayStart) === h ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`).join('')}</select></label>
   </div></div>
   <div class="section"><div class="section-head"><h2>Alışkanlıklar</h2></div><div class="card flat">${tg('showHabitsHome', 'Görevler ekranında göster')}</div></div>
-  <div class="section"><div class="section-head"><h2>Hatırlatmalar</h2></div><div class="card flat">
-    <div class="switch"><span>Bildirim izni<small>${perm === 'granted' ? 'Açık. Uygulama açıkken ya da arka plandayken hatırlatır.' : perm === 'denied' ? 'Kapalı. Telefon ayarlarından açabilirsin.' : perm === 'unsupported' ? 'Bu tarayıcı desteklemiyor. iPhone’da önce ana ekrana ekle.' : 'Henüz izin verilmedi'}</small></span>
-      ${perm === 'default' ? `<button class="btn sm" data-act="askNotif">İzin ver</button>` : ''}</div>
-  </div></div>
+  <div class="section"><div class="section-head"><h2>Bildirimler</h2></div><div class="card flat">${pushSettingsHtml()}</div></div>
   <div class="section"><div class="section-head"><h2>Veriler</h2></div><div class="card flat">
     <button class="switch" style="width:100%;background:none;border:0;border-bottom:1px solid var(--divider);text-align:left" data-act="export"><span>Dışa aktar (yedek)<small>Tüm verilerini bir dosya olarak indir</small></span>${icon('download')}</button>
     <label class="switch" style="cursor:pointer"><span>İçe aktar<small>Yedek ya da Tappsk aktarım dosyası</small></span>${icon('upload')}<input type="file" accept=".json,application/json" data-act="importFile" class="sr"></label>
@@ -936,6 +935,9 @@ const A = {
   }),
   setTheme: (el) => { M.saveSettings({ theme: el.dataset.v }); applySettings(); renderMain(); },
   askNotif: async () => { try { await Notification.requestPermission(); } catch (e) { /* yok */ } renderMain(); },
+  pushOn: async (el) => { el.disabled = true; await pushEnable(); renderMain(); },
+  pushOff: async () => { await pushDisable(); renderMain(); },
+  pushTest: async (el) => { el.disabled = true; await pushTest(); setTimeout(() => { el.disabled = false; }, 4000); },
   export: () => {
     const blob = new Blob([JSON.stringify(S.exportAll(), null, 1)], { type: 'application/json' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `gorev-yedek-${today()}.json`; a.click();
@@ -1083,6 +1085,7 @@ async function notify(title, body, tag) {
 }
 function checkReminders() {
   if (!S.state.user) return;
+  if (pushActiveHere()) return; // sunucu gönderiyor
   const now = new Date(); const t = today(); const hm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
   M.liveTasks().forEach(x => {
     if (x.done || !x.remind || x.remind.offset_min == null || !x.due_date) return;
@@ -1104,6 +1107,81 @@ setInterval(checkReminders, 30000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { checkReminders(); if (ui.booted) renderAll(); } });
 setInterval(() => { if (ui.booted && !document.hidden && !document.activeElement?.matches('input,textarea')) { const d = today(); if (d !== ui._day) { ui._day = d; renderAll(); } } }, 60000);
 ui._day = today();
+
+
+// ── Telefon bildirimleri (Web Push) ──────────────────────
+const FN_URL = SUPABASE_URL + '/functions/v1/hatirlatma';
+const push = { supported: 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window, sub: null, checked: false };
+const isStandalone = () => window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+function pushActiveHere() { try { return localStorage.getItem('gorev:push') === '1' && Notification.permission === 'granted'; } catch (e) { return false; } }
+async function pushRefresh() {
+  if (!push.supported || !sb) return;
+  try { const reg = await navigator.serviceWorker.ready; push.sub = await reg.pushManager.getSubscription(); } catch (e) { push.sub = null; }
+  push.checked = true;
+  try { if (!push.sub) localStorage.removeItem('gorev:push'); } catch (e) { /* yok */ }
+  // abonelik varsa sunucudaki kaydı tazele (başka hesapla açılmış olabilir)
+  if (push.sub && S.state.mode === 'cloud') saveSub(push.sub).catch(() => {});
+  if (ui.view === 'settings') renderMain();
+}
+function b64ToBytes(b64) {
+  const pad = '='.repeat((4 - b64.length % 4) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+async function publicKey() {
+  let { data } = await sb.from('push_config').select('vapid_public').eq('id', 1).maybeSingle();
+  if (!data) { await fetch(FN_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {}); ({ data } = await sb.from('push_config').select('vapid_public').eq('id', 1).maybeSingle()); }
+  if (!data?.vapid_public) throw new Error('Sunucu henüz hazır değil');
+  return data.vapid_public;
+}
+async function saveSub(sub) {
+  const j = sub.toJSON();
+  const { error } = await sb.from('push_subs').upsert({ endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, device: navigator.userAgent.slice(0, 150), updated_at: new Date().toISOString() }, { onConflict: 'endpoint' });
+  if (error) throw error;
+}
+async function pushEnable() {
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { toast('Bildirim izni verilmedi'); return; }
+    const reg = await navigator.serviceWorker.ready;
+    const key = await publicKey();
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+    await saveSub(sub);
+    push.sub = sub; localStorage.setItem('gorev:push', '1');
+    toast('Bildirimler açıldı');
+  } catch (e) {
+    console.warn(e);
+    toast('Açılamadı: ' + (e.message || 'bilinmeyen hata'));
+  }
+}
+async function pushDisable() {
+  try {
+    if (push.sub) { const ep = push.sub.endpoint; await push.sub.unsubscribe(); await sb.from('push_subs').delete().eq('endpoint', ep); }
+  } catch (e) { /* yok */ }
+  push.sub = null; try { localStorage.removeItem('gorev:push'); } catch (e) { /* yok */ }
+  toast('Bu cihazda bildirimler kapatıldı');
+}
+async function pushTest() {
+  const { error } = await sb.from('push_test').insert({});
+  if (error) { toast('Gönderilemedi: ' + error.message); return; }
+  fetch(FN_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+  toast('Deneme gönderildi, birkaç saniye içinde gelmeli');
+}
+function pushSettingsHtml() {
+  if (S.state.mode !== 'cloud') return `<div class="switch"><span>Telefon bildirimleri<small>Bulut hesabıyla giriş yapınca kullanılabilir</small></span></div>`;
+  if (!push.supported) {
+    const msg = isIOS() && !isStandalone() ? 'iPhone’da önce Safari → Paylaş → Ana Ekrana Ekle, sonra uygulamayı ana ekrandaki simgeden aç.' : 'Bu tarayıcı bildirimleri desteklemiyor.';
+    return `<div class="switch"><span>Telefon bildirimleri<small>${msg}</small></span></div>`;
+  }
+  const perm = Notification.permission;
+  if (perm === 'denied') return `<div class="switch"><span>Telefon bildirimleri<small>İzin kapalı. iPhone: Ayarlar → Bildirimler → Görev’den açabilirsin.</small></span></div>`;
+  if (push.sub && perm === 'granted') return `
+    <div class="switch"><span>Bu cihazda açık<small>Uygulama kapalıyken de görev ve alışkanlık hatırlatmaları gelir.</small></span><button class="btn sm" data-act="pushTest">Deneme gönder</button></div>
+    <button class="switch" style="width:100%;background:none;border:0;text-align:left;color:var(--muted)" data-act="pushOff"><span>Bu cihazda kapat</span></button>`;
+  return `<div class="switch"><span>Telefon bildirimleri<small>Hatırlatmalar uygulama kapalıyken de bu cihaza gelsin.</small></span><button class="btn-accent sm" data-act="pushOn">Aç</button></div>`;
+}
 
 // ── Servis çalışanı ──────────────────────────────────────
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
