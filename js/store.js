@@ -209,5 +209,5 @@ export function importAll(obj) {
   sortParentsFirst(tasks).forEach(r => put('tasks', r));
   (obj.habit_logs || []).forEach(r => put('habit_logs', { ...strip(r), id: uid(), habit_id: nid(r.habit_id) }));
   (obj.task_log || []).forEach(r => put('task_log', { ...strip(r), id: uid(), task_id: r.task_id ? nid(r.task_id) : null, list_id: r.list_id ? nid(r.list_id) : null }));
-  return { lists: (obj.lists || []).length, tasks: tasks.length, habits: (obj.habits || []).length };
+  return { lists: (obj.lists || []).length, tasks: tasks.filter(t => !t.parent_id).length, subs: tasks.filter(t => t.parent_id).length, habits: (obj.habits || []).length };
 }

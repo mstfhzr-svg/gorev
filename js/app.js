@@ -1036,7 +1036,7 @@ async function importFile(file) {
     if (!obj || (!obj.tasks && !obj.lists)) throw new Error('biçim');
     const r = S.importAll(obj);
     renderAll();
-    toast(`${r.lists} liste, ${r.tasks} görev, ${r.habits} alışkanlık aktarıldı`);
+    toast(`${r.lists} liste, ${r.tasks} görev, ${r.subs} alt görev, ${r.habits} alışkanlık aktarıldı`);
   } catch (e) { toast('Dosya okunamadı. Doğru dosyayı seçtiğinden emin ol.'); }
 }
 async function uploadPhotos(id, files) {
